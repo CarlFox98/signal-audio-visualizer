@@ -1,0 +1,8 @@
+# Pinned versions - tested and known-working combination.
+# If you need a newer version of any of these, test the app thoroughly
+# before relying on it (a pygame-ce update once introduced a real bug
+# in this app - see CHANGELOG / commit history for details).
+
+numpy==2.5.1
+pygame-ce==2.5.7
+pyaudiowpatch==0.2.12.8

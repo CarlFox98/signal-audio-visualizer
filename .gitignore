@@ -1,0 +1,20 @@
+# Python virtual environment
+venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Byte-compiled files
+__pycache__/
+*.pyc
+
+# Per-run logs
+logs/
+
+# Local user settings (device name, gain, etc. - machine-specific)
+visualizer_config.json
+
+# Claude Code local session/config files
+.claude/
