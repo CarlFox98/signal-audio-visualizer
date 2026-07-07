@@ -28,6 +28,7 @@ import json
 import time
 import collections
 import colorsys
+import webbrowser
 
 import numpy as np
 import pygame
@@ -84,6 +85,10 @@ try:
 except ImportError:    TKINTER_AVAILABLE = False
 
 VB_CABLE_URL = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip"
+
+APP_VERSION = "1.0.0"
+UPDATE_REPO = "CarlFox98/signal-audio-visualizer"
+UPDATE_CHECK_TIMEOUT = 4  # seconds - must not noticeably delay startup
 
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
@@ -221,7 +226,7 @@ def setup_logging():
     root_logger.addHandler(console_handler)
 
     logging.info("=" * 60)
-    logging.info("Signal Audio Visualizer starting")
+    logging.info(f"Signal Audio Visualizer starting (v{APP_VERSION})")
     logging.info(f"Log file: {log_path}")
     logging.info(f"Python: {sys.version.split()[0]}  ({platform.architecture()[0]})")
     logging.info(f"OS: {platform.platform()}")
@@ -350,6 +355,47 @@ def download_and_install_vb_cable():
     logging.info("VB-CABLE installer launched successfully")
     return True
 
+
+def _parse_version(v):
+    """Parse a version string like 'v1.2.0' or '1.2.0' into a tuple of ints
+    for comparison. Returns None if it doesn't look like a plain dotted
+    version number."""
+    v = v.strip().lstrip("vV")
+    try:
+        return tuple(int(p) for p in v.split("."))
+    except ValueError:
+        return None
+
+
+def check_for_update():
+    """Best-effort check of the GitHub Releases API for a newer published
+    version than APP_VERSION. Returns {"version", "url"} if a newer release
+    is available, otherwise None - including on any failure (no internet,
+    no releases published yet, rate limiting, unparseable tag, etc). This
+    must never raise or block startup; failures are logged and swallowed."""
+    url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"signal-audio-visualizer/{APP_VERSION}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=UPDATE_CHECK_TIMEOUT) as resp:
+            data = json.load(resp)
+        latest = _parse_version(data.get("tag_name", ""))
+        current = _parse_version(APP_VERSION)
+        if latest is not None and current is not None and latest > current:
+            return {
+                "version": data.get("tag_name"),
+                "url": data.get("html_url", f"https://github.com/{UPDATE_REPO}/releases/latest"),
+            }
+        return None
+    except urllib.error.HTTPError as e:
+        if e.code != 404:  # 404 just means no release has been published yet
+            logging.warning(f"Update check failed: HTTP {e.code}")
+        return None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        logging.warning(f"Update check failed (non-fatal): {e}")
+        return None
 
 
 def list_capture_devices(p):
@@ -484,7 +530,38 @@ def run_gui_launcher(p):
 
     ttk.Label(outer, text="SIGNAL_VIS", style="Header.TLabel").pack(anchor="w")
     ttk.Label(outer, text="choose an audio source and initial settings",
-              style="Dim.TLabel").pack(anchor="w", pady=(0, 12))
+              style="Dim.TLabel").pack(anchor="w", pady=(0, 4))
+
+    # Update check runs on a background thread so a slow/absent network
+    # connection can't delay showing this window. update_state is only
+    # written by the background thread and read by poll_update() below,
+    # which runs on the main thread via root.after() - no lock needed
+    # since it's a single flag flip plus a single dict write.
+    update_var = tk.StringVar(value="")
+    update_state = {"done": False, "result": None}
+
+    def bg_check_update():
+        update_state["result"] = check_for_update()
+        update_state["done"] = True
+
+    threading.Thread(target=bg_check_update, daemon=True).start()
+
+    def poll_update():
+        if update_state["done"]:
+            info = update_state["result"]
+            if info:
+                update_var.set(f"update available: {info['version']}  (click to open)")
+            return
+        root.after(300, poll_update)
+
+    root.after(300, poll_update)
+
+    update_label = ttk.Label(outer, textvariable=update_var, style="Dim.TLabel", cursor="hand2")
+    update_label.pack(anchor="w", pady=(0, 8))
+    update_label.bind(
+        "<Button-1>",
+        lambda e: webbrowser.open(update_state["result"]["url"]) if update_state["result"] else None,
+    )
 
     ttk.Label(outer, text="Audio sources", style="TLabel").pack(anchor="w")
     list_frame = ttk.Frame(outer)
@@ -1743,6 +1820,10 @@ def main():
         else:
             logging.warning("Tkinter not available - falling back to console picker")
             print("Tkinter isn't available on this system, falling back to console mode.\n")
+            update = check_for_update()
+            if update:
+                print(f"A newer version is available: {update['version']}")
+                print(f"  {update['url']}\n")
             device = choose_device(p)
             initial_mode, initial_gain, initial_smoothing, initial_theme = "bars", 1.4, 0.7, 0
 
