@@ -102,6 +102,25 @@ control bar.
   30 days are pruned automatically. If the app crashes, share the latest
   log file when reporting an issue.
 
+## Checking for updates
+
+On startup, the app does a quick, non-blocking check of this repo's
+[GitHub Releases](https://github.com/CarlFox98/signal-audio-visualizer/releases)
+for a newer published version than the one you're running (`APP_VERSION` in
+`audio_visualizer.py`). If one exists, the launcher window shows a clickable
+notice (or, in console-fallback mode, prints a link). It never downloads or
+installs anything automatically, and any failure (offline, no releases
+published yet) is silently ignored.
+
+To publish a version the check will detect, tag a commit and create a
+GitHub release with a matching `vX.Y.Z` tag, e.g.:
+
+```
+git tag v1.0.0
+git push origin v1.0.0
+gh release create v1.0.0 --title "v1.0.0" --generate-notes
+```
+
 ## Dependencies
 
 Pinned in [requirements.txt](requirements.txt) as a tested, known-working

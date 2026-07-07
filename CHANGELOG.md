@@ -13,6 +13,12 @@ this repository's first commit.
 
 ### Added
 
+- Startup update check: queries the GitHub Releases API for
+  `CarlFox98/signal-audio-visualizer` and, if a newer version has been
+  published, shows a clickable notice in the launcher (or prints a link in
+  console-fallback mode). Runs on a background thread, times out after 4
+  seconds, and silently does nothing on any failure (offline, no releases
+  published yet, rate limiting) — never blocks or interrupts startup.
 - WASAPI loopback capture (system audio, per-app via VB-CABLE) and
   microphone/line-in capture via `pyaudiowpatch`.
 - Seven visual modes: bars, waveform, radial, particles, rainbow bars,
