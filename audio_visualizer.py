@@ -86,13 +86,26 @@ except ImportError:    TKINTER_AVAILABLE = False
 
 VB_CABLE_URL = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip"
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 UPDATE_REPO = "CarlFox98/signal-audio-visualizer"
 UPDATE_CHECK_TIMEOUT = 4  # seconds - must not noticeably delay startup
 
-CHUNK = 1024
+CHUNK = 512
 FORMAT = pyaudio.paInt16
 WINDOW_W, WINDOW_H = 960, 560
+
+# Fixed attack rate for the spectrum envelope (see compute_spectrum) - how
+# much of a new, LOUDER value gets blended in per frame. Low = fast attack,
+# so bars snap up on a hit almost instantly. The user-facing "smoothing"
+# slider only controls the release (decay) rate, since a slow attack is
+# what makes a visualizer feel laggy, not a slow release.
+SPECTRUM_ATTACK = 0.2
+
+# How fast a peak-hold marker falls back down once the value it was
+# tracking drops (bars/radial/grid caps) - multiplied in per frame, so
+# closer to 1.0 = slower fall. Tuned to look like a classic VU meter's
+# mechanical peak-hold rather than an instant snap-back.
+PEAK_FALL_RATE = 0.985
 
 BG = (8, 9, 10)
 PANEL = (21, 23, 26)
@@ -119,6 +132,12 @@ THEMES = [
     {"name": "monochrome", "primary": (235, 235, 235), "secondary": (120, 120, 120)},
 ]
 
+def _rgb_hex(rgb):
+    """(r, g, b) int tuple -> '#rrggbb', for handing THEMES colors to
+    Tkinter widgets that need a hex string (e.g. the theme swatches)."""
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
 # Fixed palettes for modes whose visual identity IS a specific color scheme
 # (deliberately not tied to the user-selected theme above)
 FUTURISTIC_CYAN = (70, 220, 255)
@@ -138,9 +157,14 @@ LOG_MAX_AGE_DAYS = 30
 
 
 def load_config():
-    """Load the last-used device name, mode, gain, and smoothing. Returns
-    sensible defaults if the file doesn't exist or is malformed."""
-    defaults = {"device_name": None, "mode": "bars", "gain": 1.4, "smoothing": 0.7, "theme_idx": 0}
+    """Load the last-used device name, mode, gain, smoothing, and other
+    tunables. Returns sensible defaults if the file doesn't exist or is
+    malformed."""
+    defaults = {
+        "device_name": None, "mode": "bars", "gain": 1.4, "smoothing": 0.7, "theme_idx": 0,
+        "attack": SPECTRUM_ATTACK, "beat_sensitivity": 1.4, "force_software": False,
+        "window_w": None, "window_h": None,
+    }
     if not os.path.exists(CONFIG_PATH):
         return defaults
     try:
@@ -152,13 +176,19 @@ def load_config():
     return defaults
 
 
-def save_config(device_name, mode, gain, smoothing, theme_idx=0):
+def save_config(device_name, mode, gain, smoothing, theme_idx=0, attack=SPECTRUM_ATTACK,
+                 beat_sensitivity=1.4, force_software=False, window_w=None, window_h=None):
     data = {
         "device_name": device_name,
         "mode": mode,
         "gain": gain,
         "smoothing": smoothing,
         "theme_idx": theme_idx,
+        "attack": attack,
+        "beat_sensitivity": beat_sensitivity,
+        "force_software": force_software,
+        "window_w": window_w,
+        "window_h": window_h,
     }
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -501,9 +531,10 @@ def run_gui_launcher(p):
 
     root = tk.Tk()
     root.title("Signal Audio Visualizer")
-    root.geometry("620x590")
+    root.geometry(f"{saved.get('window_w') or 760}x{saved.get('window_h') or 600}")
+    root.minsize(680, 560)
     root.configure(bg=BG_HEX)
-    root.resizable(False, False)
+    root.resizable(True, True)
 
     style = ttk.Style(root)
     try:
@@ -523,13 +554,27 @@ def run_gui_launcher(p):
     style.map("Accent.TButton", background=[("active", "#4fc3b0")])
     style.configure("TRadiobutton", background=BG_HEX, foreground=TEXT_HEX, font=("Consolas", 10))
     style.map("TRadiobutton", background=[("active", BG_HEX)])
+    style.configure("TCheckbutton", background=BG_HEX, foreground=TEXT_HEX, font=("Consolas", 10))
+    style.map("TCheckbutton", background=[("active", BG_HEX)])
     style.configure("Horizontal.TScale", background=BG_HEX)
+
+    def divider(parent):
+        f = tk.Frame(parent, bg=LINE_HEX, height=1)
+        f.pack(fill="x", pady=(10, 10))
+        return f
 
     outer = ttk.Frame(root, padding=16)
     outer.pack(fill="both", expand=True)
+    outer.columnconfigure(0, weight=1, minsize=300)
+    outer.columnconfigure(1, weight=1, minsize=300)
+    outer.rowconfigure(1, weight=1)
 
-    ttk.Label(outer, text="SIGNAL_VIS", style="Header.TLabel").pack(anchor="w")
-    ttk.Label(outer, text="choose an audio source and initial settings",
+    # --- header row (spans both columns) ---------------------------------
+    header = ttk.Frame(outer)
+    header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+
+    ttk.Label(header, text="SIGNAL_VIS", style="Header.TLabel").pack(anchor="w")
+    ttk.Label(header, text="choose an audio source and initial settings",
               style="Dim.TLabel").pack(anchor="w", pady=(0, 4))
 
     # Update check runs on a background thread so a slow/absent network
@@ -556,19 +601,28 @@ def run_gui_launcher(p):
 
     root.after(300, poll_update)
 
-    update_label = ttk.Label(outer, textvariable=update_var, style="Dim.TLabel", cursor="hand2")
-    update_label.pack(anchor="w", pady=(0, 8))
+    update_label = ttk.Label(header, textvariable=update_var, style="Dim.TLabel", cursor="hand2")
+    update_label.pack(anchor="w")
     update_label.bind(
         "<Button-1>",
         lambda e: webbrowser.open(update_state["result"]["url"]) if update_state["result"] else None,
     )
 
-    ttk.Label(outer, text="Audio sources", style="TLabel").pack(anchor="w")
-    list_frame = ttk.Frame(outer)
-    list_frame.pack(fill="x", pady=(4, 4))
+    # --- left column: audio source picker ---------------------------------
+    left_col = ttk.Frame(outer)
+    left_col.grid(row=1, column=0, sticky="nsew", padx=(0, 16))
+    left_col.columnconfigure(0, weight=1)
+    left_col.rowconfigure(1, weight=1)
+
+    ttk.Label(left_col, text="Audio sources", style="TLabel").grid(row=0, column=0, sticky="w")
+
+    list_frame = ttk.Frame(left_col)
+    list_frame.grid(row=1, column=0, sticky="nsew", pady=(4, 4))
+    list_frame.columnconfigure(0, weight=1)
+    list_frame.rowconfigure(0, weight=1)
 
     scrollbar = tk.Scrollbar(list_frame)
-    scrollbar.pack(side="right", fill="y")
+    scrollbar.grid(row=0, column=1, sticky="ns")
 
     listbox = tk.Listbox(
         list_frame, height=8, bg=PANEL_HEX, fg=TEXT_HEX,
@@ -576,7 +630,7 @@ def run_gui_launcher(p):
         font=("Consolas", 10), borderwidth=0, highlightthickness=1,
         highlightbackground=LINE_HEX, yscrollcommand=scrollbar.set,
     )
-    listbox.pack(side="left", fill="x", expand=True)
+    listbox.grid(row=0, column=0, sticky="nsew")
     scrollbar.config(command=listbox.yview)
 
     devices_holder = {"devices": []}
@@ -601,10 +655,12 @@ def run_gui_launcher(p):
                     break
 
     status_var = tk.StringVar(value="")
-    ttk.Label(outer, textvariable=status_var, style="Dim.TLabel").pack(anchor="w", pady=(0, 8))
+    ttk.Label(left_col, textvariable=status_var, style="Dim.TLabel").grid(
+        row=2, column=0, sticky="w", pady=(4, 8)
+    )
 
-    btn_row = ttk.Frame(outer)
-    btn_row.pack(fill="x", pady=(0, 12))
+    btn_row = ttk.Frame(left_col)
+    btn_row.grid(row=3, column=0, sticky="w", pady=(0, 12))
 
     def do_refresh():
         refresh_devices()
@@ -651,51 +707,87 @@ def run_gui_launcher(p):
         "above, then in Windows Settings > System > Sound > Volume mixer set that "
         "app's output to the virtual cable, then pick its loopback entry here."
     )
-    tip_label = ttk.Label(outer, text=tip, style="Dim.TLabel", wraplength=580, justify="left")
-    tip_label.pack(anchor="w", pady=(0, 16))
+    tip_label = ttk.Label(left_col, text=tip, style="Dim.TLabel", wraplength=320, justify="left")
+    tip_label.grid(row=4, column=0, sticky="w")
 
-    ttk.Label(outer, text="Starting visual mode", style="TLabel").pack(anchor="w")
+    # --- right column: mode / theme / tuning settings ---------------------
+    right_col = ttk.Frame(outer)
+    right_col.grid(row=1, column=1, sticky="nsew")
+
+    ttk.Label(right_col, text="Starting visual mode", style="TLabel").pack(anchor="w")
     mode_var = tk.StringVar(value=saved.get("mode", "bars"))
-    mode_row = ttk.Frame(outer)
-    mode_row.pack(fill="x", pady=(4, 4))
-    mode_row2 = ttk.Frame(outer)
-    mode_row2.pack(fill="x", pady=(0, 12))
-    for value, label in [("bars", "bars"), ("wave", "waveform"),
-                          ("radial", "radial"), ("particles", "particles")]:
-        ttk.Radiobutton(mode_row, text=label, value=value, variable=mode_var).pack(
-            side="left", padx=(0, 16)
-        )
-    for value, label in [("rainbow", "rainbow"), ("futuristic", "futuristic"),
-                          ("grid", "neon grid")]:
-        ttk.Radiobutton(mode_row2, text=label, value=value, variable=mode_var).pack(
-            side="left", padx=(0, 16)
+    mode_grid = ttk.Frame(right_col)
+    mode_grid.pack(fill="x", pady=(4, 4), anchor="w")
+    modes = [
+        ("bars", "bars"), ("wave", "waveform"), ("radial", "radial"), ("particles", "particles"),
+        ("rainbow", "rainbow"), ("futuristic", "futuristic"), ("grid", "neon grid"),
+    ]
+    for i, (value, label) in enumerate(modes):
+        r, c = divmod(i, 3)
+        ttk.Radiobutton(mode_grid, text=label, value=value, variable=mode_var).grid(
+            row=r, column=c, sticky="w", padx=(0, 14), pady=(0, 4)
         )
 
-    theme_row = ttk.Frame(outer)
-    theme_row.pack(fill="x", pady=(0, 12))
+    divider(right_col)
+
+    theme_row = ttk.Frame(right_col)
+    theme_row.pack(fill="x", pady=(0, 4), anchor="w")
     ttk.Label(theme_row, text="color theme", style="Dim.TLabel").pack(side="left", padx=(0, 8))
     theme_names = [t["name"] for t in THEMES]
     theme_var = tk.StringVar(value=theme_names[min(saved.get("theme_idx", 0), len(theme_names) - 1)])
     theme_dropdown = ttk.Combobox(
-        theme_row, textvariable=theme_var, values=theme_names, state="readonly", width=18
+        theme_row, textvariable=theme_var, values=theme_names, state="readonly", width=16
     )
     theme_dropdown.pack(side="left")
 
-    slider_row = ttk.Frame(outer)
-    slider_row.pack(fill="x", pady=(0, 16))
+    # small live preview of the selected theme's two colors, so you don't
+    # have to start the visualizer just to see what a theme looks like
+    swatch_primary = tk.Canvas(theme_row, width=16, height=16, highlightthickness=1,
+                                highlightbackground=LINE_HEX, bg=BG_HEX)
+    swatch_primary.pack(side="left", padx=(10, 3))
+    swatch_secondary = tk.Canvas(theme_row, width=16, height=16, highlightthickness=1,
+                                  highlightbackground=LINE_HEX, bg=BG_HEX)
+    swatch_secondary.pack(side="left")
+
+    def update_swatches(*_args):
+        idx = theme_names.index(theme_var.get()) if theme_var.get() in theme_names else 0
+        swatch_primary.configure(bg=_rgb_hex(THEMES[idx]["primary"]))
+        swatch_secondary.configure(bg=_rgb_hex(THEMES[idx]["secondary"]))
+
+    theme_var.trace_add("write", update_swatches)
+    update_swatches()
+
+    divider(right_col)
+
+    ttk.Label(right_col, text="Tuning", style="TLabel").pack(anchor="w", pady=(0, 4))
+
+    def slider_row(parent, label_text, var, frm, to):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(2, 2))
+        ttk.Label(row, text=label_text, style="Dim.TLabel", width=13, anchor="w").pack(side="left")
+        ttk.Scale(row, from_=frm, to=to, variable=var).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
     gain_var = tk.DoubleVar(value=saved.get("gain", 1.4))
-    ttk.Label(slider_row, text="gain", style="Dim.TLabel").grid(row=0, column=0, sticky="w")
-    gain_scale = ttk.Scale(slider_row, from_=0.1, to=4.0, variable=gain_var, length=220)
-    gain_scale.grid(row=0, column=1, padx=(8, 0))
+    slider_row(right_col, "gain", gain_var, 0.1, 4.0)
 
     smoothing_var = tk.DoubleVar(value=saved.get("smoothing", 0.7))
-    ttk.Label(slider_row, text="smoothing", style="Dim.TLabel").grid(
-        row=1, column=0, sticky="w", pady=(8, 0)
-    )
-    smoothing_scale = ttk.Scale(slider_row, from_=0.0, to=0.97, variable=smoothing_var, length=220)
-    smoothing_scale.grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
+    slider_row(right_col, "smoothing", smoothing_var, 0.0, 0.97)
 
+    attack_var = tk.DoubleVar(value=saved.get("attack", SPECTRUM_ATTACK))
+    slider_row(right_col, "attack", attack_var, 0.02, 0.9)
+
+    beat_sensitivity_var = tk.DoubleVar(value=saved.get("beat_sensitivity", 1.4))
+    slider_row(right_col, "beat sensitivity", beat_sensitivity_var, 1.05, 2.5)
+
+    divider(right_col)
+
+    force_software_var = tk.BooleanVar(value=saved.get("force_software", False))
+    ttk.Checkbutton(
+        right_col, text="force software rendering (troubleshooting)",
+        variable=force_software_var,
+    ).pack(anchor="w")
+
+    # --- start button (spans both columns) ---------------------------------
     def do_start():
         sel = listbox.curselection()
         if not sel:
@@ -708,11 +800,21 @@ def run_gui_launcher(p):
         result["gain"] = gain_var.get()
         result["smoothing"] = smoothing_var.get()
         result["theme_idx"] = theme_idx
-        save_config(device["name"], result["mode"], result["gain"], result["smoothing"], theme_idx)
+        result["attack"] = attack_var.get()
+        result["beat_sensitivity"] = beat_sensitivity_var.get()
+        result["force_software"] = force_software_var.get()
+        result["window_w"] = root.winfo_width()
+        result["window_h"] = root.winfo_height()
+        save_config(
+            device["name"], result["mode"], result["gain"], result["smoothing"], theme_idx,
+            attack=result["attack"], beat_sensitivity=result["beat_sensitivity"],
+            force_software=result["force_software"],
+            window_w=result["window_w"], window_h=result["window_h"],
+        )
         root.destroy()
 
     start_btn = ttk.Button(outer, text="start visualizer", command=do_start, style="Accent.TButton")
-    start_btn.pack(fill="x", ipady=6)
+    start_btn.grid(row=2, column=0, columnspan=2, sticky="ew", ipady=6, pady=(16, 0))
 
     refresh_devices(select_saved=True)
     root.mainloop()
@@ -793,7 +895,7 @@ class AudioCapture:
 class Visualizer:
     CONTROL_BAR_H = 44
 
-    def __init__(self, capture, source_label):
+    def __init__(self, capture, source_label, force_software=False):
         pygame.init()
         pygame.display.set_caption("SIGNAL_VIS — " + source_label)
 
@@ -805,7 +907,11 @@ class Visualizer:
         _pre_info = pygame.display.Info()
         self.desktop_size = (_pre_info.current_w, _pre_info.current_h)
 
-        self.gl_requested = OPENGL_AVAILABLE
+        # force_software is a startup-time escape hatch (set in the
+        # launcher) for machines where GPU rendering is technically
+        # available but misbehaves - distinct from the in-app 'g' toggle,
+        # which flips self.use_gl at runtime instead.
+        self.gl_requested = OPENGL_AVAILABLE and not force_software
         self.use_gl = False
         self.screen = self._create_display(WINDOW_W, WINDOW_H, fullscreen=False,
                                             want_gl=self.gl_requested)
@@ -819,24 +925,37 @@ class Visualizer:
         self.mode = "bars"
         self.gain = 1.4
         self.smoothing = 0.7
+        self.attack = SPECTRUM_ATTACK
+        self.beat_sensitivity = 1.4
         self.smoothed_spectrum = None
         self.particles = []
         self.running = True
+
+        # peak-hold markers for the bars/radial/grid modes - lazily sized
+        # on first use, same pattern as smoothed_spectrum above
+        self.bar_peaks = None
+        self.radial_peaks = None
+        self.grid_peaks = None
 
         self.theme_idx = 0
         self.primary = THEMES[0]["primary"]
         self.secondary = THEMES[0]["secondary"]
 
-        # beat / onset detection
-        self.rms_history = collections.deque(maxlen=43)
+        # beat / onset detection - maxlen chosen to cover roughly the same
+        # ~1s rolling window as before CHUNK was halved (43 chunks @ 1024
+        # samples was ~1s at 44.1kHz; doubled here to match at 512 samples)
+        self.rms_history = collections.deque(maxlen=86)
         self.last_beat_time = 0.0
         self.beat_flash = 0.0
 
         # animation phases for the rainbow / futuristic / neon grid modes
         self.rainbow_phase = 0.0
         self.futuristic_rotation = 0.0
+        self.grid_scroll = 0.0
 
         self.control_rects = []  # populated each frame by build_control_bar
+        self.control_bar_h = self.CONTROL_BAR_H  # recomputed each frame - see _layout_control_bar
+        self._control_bar_rows = []
 
         self.fullscreen = False
         self.windowed_size = (WINDOW_W, WINDOW_H)
@@ -896,13 +1015,18 @@ class Visualizer:
 
     def toggle_fullscreen(self):
         try:
+            # want_gl=self.use_gl preserves whichever renderer is currently
+            # active across the toggle. Using self.gl_requested here (just
+            # "is GL possible on this machine") instead would silently flip
+            # a manually-forced-software renderer (via 'g') back to GPU
+            # rendering on every fullscreen toggle.
             if not self.fullscreen:
                 self.windowed_size = self.screen.get_size()
-                self.screen = self._create_display(0, 0, fullscreen=True, want_gl=self.gl_requested)
+                self.screen = self._create_display(0, 0, fullscreen=True, want_gl=self.use_gl)
                 self.fullscreen = True
             else:
                 self.screen = self._create_display(
-                    *self.windowed_size, fullscreen=False, want_gl=self.gl_requested
+                    *self.windowed_size, fullscreen=False, want_gl=self.use_gl
                 )
                 self.fullscreen = False
             logging.info(f"Toggled fullscreen: {self.fullscreen} (GPU rendering: {self.use_gl})")
@@ -933,9 +1057,34 @@ class Visualizer:
         if self.smoothed_spectrum is None or len(self.smoothed_spectrum) != len(spectrum):
             self.smoothed_spectrum = spectrum
         else:
-            a = self.smoothing
+            # Fast attack / slow release: rising bins snap toward the new
+            # (louder) value quickly, falling bins ease down at the
+            # user-controlled smoothing rate. A single symmetric
+            # coefficient here makes onsets feel laggy since it damps the
+            # attack just as much as the decay.
+            rising = spectrum > self.smoothed_spectrum
+            a = np.where(rising, self.attack, self.smoothing)
             self.smoothed_spectrum = a * self.smoothed_spectrum + (1 - a) * spectrum
         return self.smoothed_spectrum
+
+    def _update_peak(self, peaks, values):
+        """Lazy-init peak-hold array shared by the bars/radial/grid peak
+        markers: each element decays by PEAK_FALL_RATE per frame, snapping
+        back up wherever the current value exceeds the decayed peak."""
+        values = np.asarray(values, dtype=np.float32)
+        if peaks is None or len(peaks) != len(values):
+            return values.copy()
+        return np.maximum(peaks * PEAK_FALL_RATE, values)
+
+    def _ui_scale(self, w, h):
+        """Multiplier for line widths and small marker sizes (peak caps,
+        dots, HUD accents) in the bars/radial/futuristic/grid modes, so
+        they stay visible and proportionate whether the window is tiny or
+        4K, instead of being a fixed pixel count that vanishes at high
+        resolution or overwhelms a small window. 560 matches the app's
+        default window height; clamped so nothing gets sub-pixel or absurd
+        at extreme sizes."""
+        return max(0.4, min(3.0, min(w, h) / 560.0))
 
     def detect_beat(self, samples):
         """Simple onset detector: flags a beat when the current frame's RMS
@@ -950,7 +1099,7 @@ class Visualizer:
         if len(self.rms_history) >= 10:
             avg = sum(self.rms_history) / len(self.rms_history)
             now = time.time()
-            if rms > avg * 1.4 and rms > 0.02 and (now - self.last_beat_time) > 0.12:
+            if rms > avg * self.beat_sensitivity and rms > 0.02 and (now - self.last_beat_time) > 0.12:
                 beat = True
                 self.last_beat_time = now
 
@@ -959,21 +1108,49 @@ class Visualizer:
 
     def draw_bars(self, spectrum, w, h, beat_flash):
         bar_count = 96
+        # Deliberately only the bottom quarter of the spectrum, not the
+        # full Nyquist range: music's energy is overwhelmingly
+        # concentrated down here, so spreading bars across the full range
+        # instead just fills half the display with near-silent high-
+        # frequency bins and makes the whole thing look/feel less
+        # responsive. Tried the full range, reverted after it visibly
+        # deadened the visualization in testing.
         usable = spectrum[: len(spectrum) // 2]
         step = max(1, len(usable) // bar_count)
         bar_w = w / bar_count * 0.72
         gap = w / bar_count * 0.28
         boost = 1.0 + 0.18 * beat_flash
+
+        idxs = np.minimum(np.arange(bar_count) * step, len(usable) - 1)
+        values = np.clip(usable[idxs] * boost, 0.0, 1.0)
+        self.bar_peaks = self._update_peak(self.bar_peaks, values)
+
+        cy = h / 2
+        radius = max(1, min(4, int(bar_w // 2)))
+        cap_w = max(1, round(2 * self._ui_scale(w, h)))
         for i in range(bar_count):
-            idx = min(i * step, len(usable) - 1)
-            v = float(usable[idx])
-            bar_h = min(v * boost, 1.0) * (h * 0.92)
+            v = float(values[i])
+            bar_h = v * (h * 0.92)
+            half_h = bar_h / 2
             x = i * (bar_w + gap)
             t = i / bar_count
             color = tuple(
                 int(self.primary[c] * (1 - t) + self.secondary[c] * t) for c in range(3)
             )
-            pygame.draw.rect(self.screen, color, (float(x), float(h - bar_h), float(bar_w), float(bar_h)))
+            # Center-mirrored instead of bottom-anchored: grows both up and
+            # down from the vertical middle, which reads as more "alive"
+            # than a flat baseline and gives peak caps room on both ends.
+            pygame.draw.rect(
+                self.screen, color,
+                (float(x), float(cy - half_h), float(bar_w), float(bar_h)),
+                border_radius=radius,
+            )
+
+            peak_half = float(self.bar_peaks[i]) * (h * 0.92) / 2
+            if peak_half > half_h + 1:
+                cap_color = tuple(min(255, c + 70) for c in color)
+                pygame.draw.line(self.screen, cap_color, (x, cy - peak_half), (x + bar_w, cy - peak_half), cap_w)
+                pygame.draw.line(self.screen, cap_color, (x, cy + peak_half), (x + bar_w, cy + peak_half), cap_w)
 
     def draw_wave(self, samples, w, h, beat_flash):
         n = len(samples)
@@ -1002,35 +1179,81 @@ class Visualizer:
 
     def draw_radial(self, spectrum, w, h, beat_flash):
         cx, cy = w / 2, h / 2
-        base_r = min(w, h) * 0.18 * (1.0 + 0.12 * beat_flash)
-        bar_count = 120
         usable = spectrum[: len(spectrum) // 2]
-        step = max(1, len(usable) // bar_count)
+        bass = float(usable[:16].mean()) if len(usable) >= 16 else float(usable.mean())
+        scale = self._ui_scale(w, h)
+
+        base_r = min(w, h) * 0.18 * (1.0 + 0.12 * beat_flash)
+        core_r = base_r * (0.45 + 0.35 * bass)
+
+        # soft glow behind a solid core disc, both reactive to bass energy -
+        # a "sunburst" center instead of just an empty ring
+        glow = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (*self.primary, 50), (int(cx), int(cy)), int(core_r * 1.8))
+        pygame.draw.circle(glow, (*self.primary, 90), (int(cx), int(cy)), int(core_r * 1.25))
+        self.screen.blit(glow, (0, 0))
+        pygame.draw.circle(self.screen, self.primary, (int(cx), int(cy)), max(2, int(core_r)))
 
         ring_color = tuple(
             min(255, int(LINE[c] + (255 - LINE[c]) * beat_flash * 0.5)) for c in range(3)
         )
-        pygame.draw.circle(self.screen, ring_color, (int(cx), int(cy)), int(base_r), 1)
+        ring_w = max(1, round(1 * scale))
+        pygame.draw.circle(self.screen, ring_color, (int(cx), int(cy)), int(base_r), ring_w)
 
         # a soft expanding ring that appears briefly on each detected beat
         if beat_flash > 0.05:
             pulse_r = base_r + beat_flash * (min(w, h) * 0.12)
             pulse_alpha = max(0, min(255, int(beat_flash * 160)))
             s = pygame.Surface((w, h), pygame.SRCALPHA)
-            pygame.draw.circle(s, (*self.primary, pulse_alpha), (int(cx), int(cy)), int(pulse_r), 2)
+            pygame.draw.circle(s, (*self.primary, pulse_alpha), (int(cx), int(cy)), int(pulse_r), max(1, round(2 * scale)))
             self.screen.blit(s, (0, 0))
 
+        bar_count = 120
+        step = max(1, len(usable) // bar_count)
+        idxs = np.minimum(np.arange(bar_count) * step, len(usable) - 1)
+        values = np.clip(usable[idxs], 0.0, 1.0)
+        self.radial_peaks = self._update_peak(self.radial_peaks, values)
+        max_len = min(w, h) * 0.32
+        spoke_w = max(1, round(3 * scale))
+        peak_dot_r = max(1, round(2 * scale))
+
         for i in range(bar_count):
-            idx = min(i * step, len(usable) - 1)
-            v = float(usable[idx])
-            length = min(v, 1.0) * (min(w, h) * 0.32)
+            v = float(values[i])
+            length = v * max_len
             angle = (i / bar_count) * 2 * np.pi - np.pi / 2
             x1 = float(cx + np.cos(angle) * base_r)
             y1 = float(cy + np.sin(angle) * base_r)
             x2 = float(cx + np.cos(angle) * (base_r + length))
             y2 = float(cy + np.sin(angle) * (base_r + length))
             color = self.primary if i / bar_count < 0.5 else self.secondary
-            pygame.draw.line(self.screen, color, (x1, y1), (x2, y2), 3)
+            pygame.draw.line(self.screen, color, (x1, y1), (x2, y2), spoke_w)
+
+            peak_len = float(self.radial_peaks[i]) * max_len
+            if peak_len > length + 2:
+                px = float(cx + np.cos(angle) * (base_r + peak_len))
+                py = float(cy + np.sin(angle) * (base_r + peak_len))
+                cap_color = tuple(min(255, c + 70) for c in color)
+                pygame.draw.circle(self.screen, cap_color, (int(px), int(py)), peak_dot_r)
+
+        # shorter inner spokes pointing back toward the core, sampling a
+        # different (upper-mid) slice of the usable range for a mandala-like
+        # second layer that moves somewhat independently of the outer ring
+        inner_count = 60
+        inner_offset = len(usable) // 2
+        inner_span = len(usable) - inner_offset
+        if inner_span > 0:
+            inner_step = max(1, inner_span // inner_count)
+            for i in range(inner_count):
+                idx = min(inner_offset + i * inner_step, len(usable) - 1)
+                v = float(usable[idx])
+                length = v * (base_r - core_r) * 0.9
+                angle = (i / inner_count) * 2 * np.pi - np.pi / 2 + (np.pi / inner_count)
+                x1 = float(cx + np.cos(angle) * base_r)
+                y1 = float(cy + np.sin(angle) * base_r)
+                x2 = float(cx + np.cos(angle) * (base_r - length))
+                y2 = float(cy + np.sin(angle) * (base_r - length))
+                color = self.secondary if i / inner_count < 0.5 else self.primary
+                pygame.draw.line(self.screen, color, (x1, y1), (x2, y2), max(1, round(2 * scale)))
 
     def draw_particles(self, spectrum, w, h, beat_flash, beat):
         overlay = pygame.Surface((w, h))
@@ -1097,10 +1320,12 @@ class Visualizer:
             pygame.draw.rect(self.screen, color, (float(x), float(y0), float(bar_w), float(bar_h)))
 
     def draw_futuristic(self, spectrum, w, h, beat_flash):
-        """Sci-fi HUD-style readout: a rotating dashed outer ring, a
-        segmented spectrum dial, a pulsing core, and HUD corner brackets."""
+        """Sci-fi HUD-style readout: a rotating outer ring, a counter-
+        rotating dashed ring, a radar sweep, a segmented spectrum dial, a
+        pulsing core, and beat-reactive HUD corner brackets."""
         cx, cy = w / 2, h / 2
         self.futuristic_rotation = (self.futuristic_rotation + 0.006) % (2 * np.pi)
+        scale = self._ui_scale(w, h)
 
         usable = spectrum[: len(spectrum) // 2]
         seg_count = 72
@@ -1114,9 +1339,39 @@ class Visualizer:
         for i in range(ring_segs + 1):
             a = i / ring_segs * 2 * np.pi + self.futuristic_rotation
             pts.append((cx + np.cos(a) * outer_r * 1.05, cy + np.sin(a) * outer_r * 1.05))
-        pygame.draw.lines(self.screen, FUTURISTIC_CYAN, True, pts, 1)
+        pygame.draw.lines(self.screen, FUTURISTIC_CYAN, True, pts, max(1, round(1 * scale)))
 
-        # segmented spectrum dial
+        # a second, faster, counter-rotating ring further out with an
+        # actual dash pattern (skips every other segment), for parallax
+        dash_r = outer_r * 1.18
+        dash_segs = 60
+        dash_rotation = -self.futuristic_rotation * 1.8
+        dash_w = max(1, round(1 * scale))
+        for i in range(0, dash_segs, 2):
+            a1 = i / dash_segs * 2 * np.pi + dash_rotation
+            a2 = (i + 1) / dash_segs * 2 * np.pi + dash_rotation
+            x1 = cx + np.cos(a1) * dash_r
+            y1 = cy + np.sin(a1) * dash_r
+            x2 = cx + np.cos(a2) * dash_r
+            y2 = cy + np.sin(a2) * dash_r
+            pygame.draw.line(self.screen, FUTURISTIC_CYAN, (x1, y1), (x2, y2), dash_w)
+
+        # radar-style sweep with a fading trail, rotating independently of
+        # the two rings above
+        sweep_angle = self.futuristic_rotation * 2.5
+        trail_count = 10
+        trail_w = max(1, round(2 * scale))
+        trail_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        for i in range(trail_count):
+            a = sweep_angle - i * 0.05
+            alpha = max(0, int(160 * (1 - i / trail_count)))
+            x2 = cx + np.cos(a) * outer_r * 1.05
+            y2 = cy + np.sin(a) * outer_r * 1.05
+            pygame.draw.line(trail_surf, (*FUTURISTIC_CYAN, alpha), (cx, cy), (x2, y2), trail_w)
+        self.screen.blit(trail_surf, (0, 0))
+
+        # segmented spectrum dial - brightness/width now scale with the bin
+        # value instead of a flat color, so louder segments visibly pop
         for i in range(seg_count):
             idx = min(i * step, len(usable) - 1)
             v = float(usable[idx])
@@ -1126,57 +1381,101 @@ class Visualizer:
             y1 = cy + np.sin(angle) * inner_r
             x2 = cx + np.cos(angle) * (inner_r + length)
             y2 = cy + np.sin(angle) * (inner_r + length)
-            pygame.draw.line(self.screen, FUTURISTIC_CYAN, (x1, y1), (x2, y2), 2)
+            color = tuple(
+                int(FUTURISTIC_CYAN[c] * (1 - v) + FUTURISTIC_WHITE[c] * v) for c in range(3)
+            )
+            pygame.draw.line(self.screen, color, (x1, y1), (x2, y2), max(1, round((2 + v) * scale)))
 
         # pulsing core
         core_r = max(2, inner_r * 0.5 * (1.0 + 0.3 * beat_flash))
-        pygame.draw.circle(self.screen, FUTURISTIC_WHITE, (int(cx), int(cy)), int(core_r), 2)
+        pygame.draw.circle(self.screen, FUTURISTIC_WHITE, (int(cx), int(cy)), int(core_r), max(1, round(2 * scale)))
 
-        # HUD corner brackets
-        bracket, margin = 24, 16
+        # HUD corner brackets - extend briefly on a detected beat. Sized as
+        # a fraction of min(w, h) (not fixed pixels) so they stay correctly
+        # anchored to the corners at any window size/resolution instead of
+        # becoming a speck at 4K or overlapping the dial in a tiny window.
+        ref = min(w, h)
+        bracket = ref * (24 + 14 * beat_flash) / 560.0
+        margin = ref * 16 / 560.0
+        bracket_w = max(1, round(2 * scale))
         for bx, by, dx, dy in [
             (margin, margin, 1, 1), (w - margin, margin, -1, 1),
             (margin, h - margin, 1, -1), (w - margin, h - margin, -1, -1),
         ]:
-            pygame.draw.line(self.screen, FUTURISTIC_CYAN, (bx, by), (bx + dx * bracket, by), 2)
-            pygame.draw.line(self.screen, FUTURISTIC_CYAN, (bx, by), (bx, by + dy * bracket), 2)
+            pygame.draw.line(self.screen, FUTURISTIC_CYAN, (bx, by), (bx + dx * bracket, by), bracket_w)
+            pygame.draw.line(self.screen, FUTURISTIC_CYAN, (bx, by), (bx, by + dy * bracket), bracket_w)
 
     def draw_grid(self, spectrum, w, h, beat_flash):
-        """Neon perspective grid floor with glowing horizon and
-        spectrum-reactive light bars - an original take on the glowing
-        circuit-grid aesthetic, not any specific copyrighted artwork."""
+        """Neon perspective grid floor with a glowing, beat-reactive
+        synthwave sun, continuously scrolling floor lines, and spectrum-
+        reactive light bars with peak-hold caps - an original take on the
+        glowing circuit-grid aesthetic, not any specific copyrighted
+        artwork."""
         horizon_y = h * 0.42
         vanish_x = w / 2
+        scale = self._ui_scale(w, h)
+
+        usable = spectrum[: len(spectrum) // 2]
+        bass = float(usable[:16].mean()) if len(usable) >= 16 else float(usable.mean())
+        self.grid_scroll = (self.grid_scroll + 0.006 + 0.03 * bass) % 1.0
 
         glow_color = NEON_ORANGE if beat_flash > 0.4 else NEON_CYAN
-        pygame.draw.line(self.screen, glow_color, (0, horizon_y), (w, horizon_y), 2)
+
+        # glowing sun sitting on the horizon, pulsing with bass/beat -
+        # drawn first, then masked below the horizon (solid BG rect) so it
+        # can't bleed through the gaps in the floor grid drawn afterward
+        sun_r = min(w, h) * 0.09 * (1.0 + 0.15 * bass + 0.25 * beat_flash)
+        glow = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (*glow_color, 60), (int(vanish_x), int(horizon_y)), int(sun_r * 1.8))
+        pygame.draw.circle(glow, (*glow_color, 110), (int(vanish_x), int(horizon_y)), int(sun_r * 1.3))
+        self.screen.blit(glow, (0, 0))
+        pygame.draw.circle(self.screen, glow_color, (int(vanish_x), int(horizon_y)), int(sun_r))
+        pygame.draw.rect(self.screen, BG, (0, horizon_y, w, h - horizon_y))
+
+        pygame.draw.line(self.screen, glow_color, (0, horizon_y), (w, horizon_y), max(1, round(2 * scale)))
 
         # converging vertical lines toward the vanishing point
         num_v = 16
+        thin_w = max(1, round(1 * scale))
         for i in range(num_v + 1):
             bx = i / num_v * w
-            pygame.draw.line(self.screen, NEON_CYAN, (bx, h), (vanish_x, horizon_y), 1)
+            pygame.draw.line(self.screen, NEON_CYAN, (bx, h), (vanish_x, horizon_y), thin_w)
 
-        # horizontal lines with perspective spacing, brighter toward viewer
+        # horizontal lines with perspective spacing, continuously scrolling
+        # toward the viewer at a rate driven by bass energy instead of
+        # sitting static
         num_h = 10
         for j in range(1, num_h + 1):
-            t = j / num_h
+            t = (j / num_h + self.grid_scroll) % 1.0
+            if t <= 0.001:
+                continue
             y = horizon_y + (h - horizon_y) * (t ** 2)
             fade = 0.3 + 0.7 * t
             color = tuple(int(c * fade) for c in NEON_CYAN)
-            pygame.draw.line(self.screen, color, (0, y), (w, y), 1)
+            pygame.draw.line(self.screen, color, (0, y), (w, y), thin_w)
 
-        # spectrum-reactive light bars rising from the grid
-        usable = spectrum[: len(spectrum) // 2]
+        # spectrum-reactive light bars rising from the grid, with peak-hold caps
         bar_count = 40
         step = max(1, len(usable) // bar_count)
+        idxs = np.minimum(np.arange(bar_count) * step, len(usable) - 1)
+        values = np.clip(usable[idxs], 0.0, 1.0)
+        self.grid_peaks = self._update_peak(self.grid_peaks, values)
+        bar_w = max(1, round(2 * scale))
+        cap_half_w = max(1, round(3 * scale))
         for i in range(bar_count):
-            idx = min(i * step, len(usable) - 1)
-            v = float(usable[idx])
+            v = float(values[i])
             bx = (i + 0.5) / bar_count * w
-            bar_h = min(v, 1.0) * (horizon_y * 0.9)
+            bar_h = v * (horizon_y * 0.9)
             color = NEON_ORANGE if v > 0.6 else NEON_CYAN
-            pygame.draw.line(self.screen, color, (bx, horizon_y), (bx, horizon_y - bar_h), 2)
+            pygame.draw.line(self.screen, color, (bx, horizon_y), (bx, horizon_y - bar_h), bar_w)
+
+            peak_h = float(self.grid_peaks[i]) * (horizon_y * 0.9)
+            if peak_h > bar_h + 2:
+                cap_color = tuple(min(255, c + 60) for c in color)
+                pygame.draw.line(
+                    self.screen, cap_color,
+                    (bx - cap_half_w, horizon_y - peak_h), (bx + cap_half_w, horizon_y - peak_h), bar_w,
+                )
 
     # ------------------------------------------------------------------
     # GPU (OpenGL) rendering path. Mirrors each software draw_* method but
@@ -1208,23 +1507,48 @@ class Visualizer:
         gap = w / bar_count * 0.28
         boost = 1.0 + 0.18 * beat_flash
 
+        idxs = np.minimum(np.arange(bar_count) * step, len(usable) - 1)
+        values = np.clip(usable[idxs] * boost, 0.0, 1.0)
+        self.bar_peaks = self._update_peak(self.bar_peaks, values)
+        cy = h / 2
+
         gl.glBegin(gl.GL_QUADS)
         for i in range(bar_count):
-            idx = min(i * step, len(usable) - 1)
-            v = float(usable[idx])
-            bar_h = min(v * boost, 1.0) * (h * 0.92)
+            v = float(values[i])
+            bar_h = v * (h * 0.92)
+            half_h = bar_h / 2
             x = i * (bar_w + gap)
             t = i / bar_count
             color = tuple(
                 (self.primary[c] * (1 - t) + self.secondary[c] * t) / 255 for c in range(3)
             )
-            y0 = h - bar_h
+            y0, y1 = cy - half_h, cy + half_h
             gl.glColor3f(*color)
-            gl.glVertex2f(x, h)
-            gl.glVertex2f(x + bar_w, h)
+            gl.glVertex2f(x, y1)
+            gl.glVertex2f(x + bar_w, y1)
             gl.glVertex2f(x + bar_w, y0)
             gl.glVertex2f(x, y0)
         gl.glEnd()
+
+        gl.glLineWidth(max(1.0, 2.0 * self._ui_scale(w, h)))
+        gl.glBegin(gl.GL_LINES)
+        for i in range(bar_count):
+            v = float(values[i])
+            half_h = v * (h * 0.92) / 2
+            peak_half = float(self.bar_peaks[i]) * (h * 0.92) / 2
+            if peak_half <= half_h + 1:
+                continue
+            x = i * (bar_w + gap)
+            t = i / bar_count
+            color = tuple(
+                min(1.0, (self.primary[c] * (1 - t) + self.secondary[c] * t) / 255 + 0.27)
+                for c in range(3)
+            )
+            gl.glColor3f(*color)
+            gl.glVertex2f(x, cy - peak_half); gl.glVertex2f(x + bar_w, cy - peak_half)
+            gl.glVertex2f(x, cy + peak_half); gl.glVertex2f(x + bar_w, cy + peak_half)
+        gl.glEnd()
+        gl.glLineWidth(1.0)
 
     def _gl_line(self, x1, y1, x2, y2, color, width=1.0):
         gl.glLineWidth(float(width))
@@ -1257,17 +1581,36 @@ class Visualizer:
 
         self._gl_line(0, h / 2, w, h / 2, LINE, 1)
 
+    def _gl_filled_circle(self, cx, cy, r, color_rgba, segs=32):
+        gl.glColor4f(*color_rgba)
+        gl.glBegin(gl.GL_TRIANGLE_FAN)
+        gl.glVertex2f(cx, cy)
+        for i in range(segs + 1):
+            a = i / segs * 2 * np.pi
+            gl.glVertex2f(cx + np.cos(a) * r, cy + np.sin(a) * r)
+        gl.glEnd()
+
     def gl_draw_radial(self, spectrum, w, h, beat_flash):
         cx, cy = w / 2, h / 2
-        base_r = min(w, h) * 0.18 * (1.0 + 0.12 * beat_flash)
-        bar_count = 120
         usable = spectrum[: len(spectrum) // 2]
+        bass = float(usable[:16].mean()) if len(usable) >= 16 else float(usable.mean())
+        scale = self._ui_scale(w, h)
+
+        base_r = min(w, h) * 0.18 * (1.0 + 0.12 * beat_flash)
+        core_r = base_r * (0.45 + 0.35 * bass)
+        bar_count = 120
         step = max(1, len(usable) // bar_count)
         segs = 64
+
+        primary_f = tuple(c / 255 for c in self.primary)
+        self._gl_filled_circle(cx, cy, core_r * 1.8, (*primary_f, 0.20))
+        self._gl_filled_circle(cx, cy, core_r * 1.25, (*primary_f, 0.35))
+        self._gl_filled_circle(cx, cy, max(2, core_r), (*primary_f, 1.0))
 
         ring_color = tuple(
             min(255, int(LINE[c] + (255 - LINE[c]) * beat_flash * 0.5)) / 255 for c in range(3)
         )
+        gl.glLineWidth(max(1.0, 1.0 * scale))
         gl.glColor3f(*ring_color)
         gl.glBegin(gl.GL_LINE_LOOP)
         for i in range(segs):
@@ -1279,17 +1622,23 @@ class Visualizer:
             pulse_r = base_r + beat_flash * (min(w, h) * 0.12)
             alpha = max(0.0, min(1.0, beat_flash * 160 / 255))
             gl.glColor4f(self.primary[0] / 255, self.primary[1] / 255, self.primary[2] / 255, alpha)
+            gl.glLineWidth(max(1.0, 2.0 * scale))
             gl.glBegin(gl.GL_LINE_LOOP)
             for i in range(segs):
                 a = i / segs * 2 * np.pi
                 gl.glVertex2f(cx + np.cos(a) * pulse_r, cy + np.sin(a) * pulse_r)
             gl.glEnd()
 
+        idxs = np.minimum(np.arange(bar_count) * step, len(usable) - 1)
+        values = np.clip(usable[idxs], 0.0, 1.0)
+        self.radial_peaks = self._update_peak(self.radial_peaks, values)
+        max_len = min(w, h) * 0.32
+
+        gl.glLineWidth(max(1.0, 3.0 * scale))
         gl.glBegin(gl.GL_LINES)
         for i in range(bar_count):
-            idx = min(i * step, len(usable) - 1)
-            v = float(usable[idx])
-            length = min(v, 1.0) * (min(w, h) * 0.32)
+            v = float(values[i])
+            length = v * max_len
             angle = (i / bar_count) * 2 * np.pi - np.pi / 2
             x1 = cx + np.cos(angle) * base_r
             y1 = cy + np.sin(angle) * base_r
@@ -1300,6 +1649,45 @@ class Visualizer:
             gl.glVertex2f(x1, y1)
             gl.glVertex2f(x2, y2)
         gl.glEnd()
+
+        peak_dot_r = max(1, 2 * scale)
+        for i in range(bar_count):
+            peak_len = float(self.radial_peaks[i]) * max_len
+            v = float(values[i])
+            if peak_len <= v * max_len + 2:
+                continue
+            angle = (i / bar_count) * 2 * np.pi - np.pi / 2
+            px = cx + np.cos(angle) * (base_r + peak_len)
+            py = cy + np.sin(angle) * (base_r + peak_len)
+            color = self.primary if i / bar_count < 0.5 else self.secondary
+            cap = tuple(min(1.0, c / 255 + 0.27) for c in color)
+            self._gl_filled_circle(px, py, peak_dot_r, (*cap, 1.0), segs=8)
+
+        # shorter inner spokes pointing back toward the core, sampling a
+        # different (upper-mid) slice of the usable range - mirrors the
+        # software path's mandala-style second layer
+        inner_count = 60
+        inner_offset = len(usable) // 2
+        inner_span = len(usable) - inner_offset
+        if inner_span > 0:
+            inner_step = max(1, inner_span // inner_count)
+            gl.glLineWidth(max(1.0, 2.0 * scale))
+            gl.glBegin(gl.GL_LINES)
+            for i in range(inner_count):
+                idx = min(inner_offset + i * inner_step, len(usable) - 1)
+                v = float(usable[idx])
+                length = v * (base_r - core_r) * 0.9
+                angle = (i / inner_count) * 2 * np.pi - np.pi / 2 + (np.pi / inner_count)
+                x1 = cx + np.cos(angle) * base_r
+                y1 = cy + np.sin(angle) * base_r
+                x2 = cx + np.cos(angle) * (base_r - length)
+                y2 = cy + np.sin(angle) * (base_r - length)
+                color = self.secondary if i / inner_count < 0.5 else self.primary
+                gl.glColor3ub(*color)
+                gl.glVertex2f(x1, y1)
+                gl.glVertex2f(x2, y2)
+            gl.glEnd()
+            gl.glLineWidth(1.0)
 
     def gl_draw_particles(self, spectrum, w, h, beat_flash, beat):
         avg = float(np.mean(spectrum[:32])) if len(spectrum) else 0.0
@@ -1369,6 +1757,7 @@ class Visualizer:
     def gl_draw_futuristic(self, spectrum, w, h, beat_flash):
         cx, cy = w / 2, h / 2
         self.futuristic_rotation = (self.futuristic_rotation + 0.006) % (2 * np.pi)
+        scale = self._ui_scale(w, h)
 
         usable = spectrum[: len(spectrum) // 2]
         seg_count = 72
@@ -1379,6 +1768,7 @@ class Visualizer:
         white = tuple(c / 255 for c in FUTURISTIC_WHITE)
 
         gl.glColor3f(*cyan)
+        gl.glLineWidth(max(1.0, 1.0 * scale))
         ring_segs = 90
         gl.glBegin(gl.GL_LINE_LOOP)
         for i in range(ring_segs):
@@ -1386,7 +1776,35 @@ class Visualizer:
             gl.glVertex2f(cx + np.cos(a) * outer_r * 1.05, cy + np.sin(a) * outer_r * 1.05)
         gl.glEnd()
 
+        # second, faster, counter-rotating dashed ring further out
+        dash_r = outer_r * 1.18
+        dash_segs = 60
+        dash_rotation = -self.futuristic_rotation * 1.8
+        gl.glLineWidth(max(1.0, 1.0 * scale))
         gl.glBegin(gl.GL_LINES)
+        for i in range(0, dash_segs, 2):
+            a1 = i / dash_segs * 2 * np.pi + dash_rotation
+            a2 = (i + 1) / dash_segs * 2 * np.pi + dash_rotation
+            gl.glVertex2f(cx + np.cos(a1) * dash_r, cy + np.sin(a1) * dash_r)
+            gl.glVertex2f(cx + np.cos(a2) * dash_r, cy + np.sin(a2) * dash_r)
+        gl.glEnd()
+
+        # radar-style sweep with a fading trail
+        sweep_angle = self.futuristic_rotation * 2.5
+        trail_count = 10
+        gl.glLineWidth(max(1.0, 2.0 * scale))
+        gl.glBegin(gl.GL_LINES)
+        for i in range(trail_count):
+            a = sweep_angle - i * 0.05
+            alpha = max(0.0, (1 - i / trail_count)) * (160 / 255)
+            gl.glColor4f(cyan[0], cyan[1], cyan[2], alpha)
+            gl.glVertex2f(cx, cy)
+            gl.glVertex2f(cx + np.cos(a) * outer_r * 1.05, cy + np.sin(a) * outer_r * 1.05)
+        gl.glEnd()
+
+        # segmented dial - each segment gets its own Begin/End so its line
+        # width can scale with the bin value (glLineWidth can't be changed
+        # mid-batch), mirroring the software path's per-segment thickness
         for i in range(seg_count):
             idx = min(i * step, len(usable) - 1)
             v = float(usable[idx])
@@ -1396,20 +1814,29 @@ class Visualizer:
             y1 = cy + np.sin(angle) * inner_r
             x2 = cx + np.cos(angle) * (inner_r + length)
             y2 = cy + np.sin(angle) * (inner_r + length)
+            gl.glLineWidth(max(1.0, (2 + v) * scale))
+            gl.glColor3f(*(cyan[c] * (1 - v) + white[c] * v for c in range(3)))
+            gl.glBegin(gl.GL_LINES)
             gl.glVertex2f(x1, y1)
             gl.glVertex2f(x2, y2)
-        gl.glEnd()
+            gl.glEnd()
 
         core_r = max(2, inner_r * 0.5 * (1.0 + 0.3 * beat_flash))
         gl.glColor3f(*white)
+        gl.glLineWidth(max(1.0, 2.0 * scale))
         gl.glBegin(gl.GL_LINE_LOOP)
         for i in range(32):
             a = i / 32 * 2 * np.pi
             gl.glVertex2f(cx + np.cos(a) * core_r, cy + np.sin(a) * core_r)
         gl.glEnd()
 
-        bracket, margin = 24, 16
+        # HUD corner brackets sized as a fraction of min(w, h), not fixed
+        # pixels - see the software path's comment for why
+        ref = min(w, h)
+        bracket = ref * (24 + 14 * beat_flash) / 560.0
+        margin = ref * 16 / 560.0
         gl.glColor3f(*cyan)
+        gl.glLineWidth(max(1.0, 2.0 * scale))
         gl.glBegin(gl.GL_LINES)
         for bx, by, dx, dy in [
             (margin, margin, 1, 1), (w - margin, margin, -1, 1),
@@ -1424,14 +1851,35 @@ class Visualizer:
         vanish_x = w / 2
         cyan = tuple(c / 255 for c in NEON_CYAN)
         orange = tuple(c / 255 for c in NEON_ORANGE)
+        scale = self._ui_scale(w, h)
 
-        gl.glColor3f(*(orange if beat_flash > 0.4 else cyan))
-        gl.glLineWidth(2.0)
+        usable = spectrum[: len(spectrum) // 2]
+        bass = float(usable[:16].mean()) if len(usable) >= 16 else float(usable.mean())
+        self.grid_scroll = (self.grid_scroll + 0.006 + 0.03 * bass) % 1.0
+        glow_color = orange if beat_flash > 0.4 else cyan
+
+        # glowing sun on the horizon, pulsing with bass/beat, masked below
+        # the horizon so it can't show through the floor grid drawn after
+        sun_r = min(w, h) * 0.09 * (1.0 + 0.15 * bass + 0.25 * beat_flash)
+        self._gl_filled_circle(vanish_x, horizon_y, sun_r * 1.8, (*glow_color, 0.24))
+        self._gl_filled_circle(vanish_x, horizon_y, sun_r * 1.3, (*glow_color, 0.43))
+        self._gl_filled_circle(vanish_x, horizon_y, sun_r, (*glow_color, 1.0))
+        bg_f = tuple(c / 255 for c in BG)
+        gl.glColor3f(*bg_f)
+        gl.glBegin(gl.GL_QUADS)
+        gl.glVertex2f(0, horizon_y)
+        gl.glVertex2f(w, horizon_y)
+        gl.glVertex2f(w, h)
+        gl.glVertex2f(0, h)
+        gl.glEnd()
+
+        gl.glColor3f(*glow_color)
+        gl.glLineWidth(max(1.0, 2.0 * scale))
         gl.glBegin(gl.GL_LINES)
         gl.glVertex2f(0, horizon_y); gl.glVertex2f(w, horizon_y)
         gl.glEnd()
 
-        gl.glLineWidth(1.0)
+        gl.glLineWidth(max(1.0, 1.0 * scale))
         gl.glColor3f(*cyan)
         gl.glBegin(gl.GL_LINES)
         num_v = 16
@@ -1443,25 +1891,44 @@ class Visualizer:
         gl.glBegin(gl.GL_LINES)
         num_h = 10
         for j in range(1, num_h + 1):
-            t = j / num_h
+            t = (j / num_h + self.grid_scroll) % 1.0
+            if t <= 0.001:
+                continue
             y = horizon_y + (h - horizon_y) * (t ** 2)
             fade = 0.3 + 0.7 * t
             gl.glColor3f(cyan[0] * fade, cyan[1] * fade, cyan[2] * fade)
             gl.glVertex2f(0, y); gl.glVertex2f(w, y)
         gl.glEnd()
 
-        usable = spectrum[: len(spectrum) // 2]
         bar_count = 40
         step = max(1, len(usable) // bar_count)
-        gl.glLineWidth(2.0)
+        idxs = np.minimum(np.arange(bar_count) * step, len(usable) - 1)
+        values = np.clip(usable[idxs], 0.0, 1.0)
+        self.grid_peaks = self._update_peak(self.grid_peaks, values)
+        cap_half_w = max(1, round(3 * scale))
+
+        gl.glLineWidth(max(1.0, 2.0 * scale))
         gl.glBegin(gl.GL_LINES)
         for i in range(bar_count):
-            idx = min(i * step, len(usable) - 1)
-            v = float(usable[idx])
+            v = float(values[i])
             bx = (i + 0.5) / bar_count * w
-            bar_h = min(v, 1.0) * (horizon_y * 0.9)
+            bar_h = v * (horizon_y * 0.9)
             gl.glColor3f(*(orange if v > 0.6 else cyan))
             gl.glVertex2f(bx, horizon_y); gl.glVertex2f(bx, horizon_y - bar_h)
+        gl.glEnd()
+
+        gl.glBegin(gl.GL_LINES)
+        for i in range(bar_count):
+            v = float(values[i])
+            bar_h = v * (horizon_y * 0.9)
+            peak_h = float(self.grid_peaks[i]) * (horizon_y * 0.9)
+            if peak_h <= bar_h + 2:
+                continue
+            bx = (i + 0.5) / bar_count * w
+            base_color = orange if v > 0.6 else cyan
+            cap_color = tuple(min(1.0, c + 0.24) for c in base_color)
+            gl.glColor3f(*cap_color)
+            gl.glVertex2f(bx - cap_half_w, horizon_y - peak_h); gl.glVertex2f(bx + cap_half_w, horizon_y - peak_h)
         gl.glEnd()
         gl.glLineWidth(1.0)
 
@@ -1505,17 +1972,17 @@ class Visualizer:
             self.draw_hud(w, top_h, fps)
             self._gl_draw_texture_from_surface(top_surface, w, top_h, dest_y=0)
 
-            bottom_surface = pygame.Surface((w, self.CONTROL_BAR_H), pygame.SRCALPHA)
+            bottom_surface = pygame.Surface((w, self.control_bar_h), pygame.SRCALPHA)
             self.screen = bottom_surface
-            self.draw_control_bar(w, self.CONTROL_BAR_H)
+            self.draw_control_bar(w, self.control_bar_h)
             # draw_control_bar builds self.control_rects in the small
             # offscreen surface's LOCAL coordinates - translate them back
             # to real window coordinates so mouse clicks hit-test correctly
-            offset_y = h - self.CONTROL_BAR_H
+            offset_y = h - self.control_bar_h
             self.control_rects = [
                 (rect.move(0, offset_y), kind, key) for (rect, kind, key) in self.control_rects
             ]
-            self._gl_draw_texture_from_surface(bottom_surface, w, self.CONTROL_BAR_H, dest_y=offset_y)
+            self._gl_draw_texture_from_surface(bottom_surface, w, self.control_bar_h, dest_y=offset_y)
         finally:
             self.screen = real_screen
 
@@ -1596,66 +2063,119 @@ class Visualizer:
         if hint_x >= left_edge and (hint_x + hint_s.get_width()) <= right_edge:
             self.screen.blit(hint_s, (hint_x, 6))
 
-    def draw_control_bar(self, w, h):
-        """Draws the clickable bottom control bar and rebuilds the hit-test
-        rects used by handle_control_click(). Called once per frame."""
-        bar_y = h - self.CONTROL_BAR_H
-        pygame.draw.rect(self.screen, PANEL, (0, bar_y, w, self.CONTROL_BAR_H))
-        pygame.draw.line(self.screen, LINE, (0, bar_y), (w, bar_y), 1)
+    def _layout_control_bar(self, w):
+        """Two-pass control bar layout: build the ordered list of buttons/
+        labels, measure each one's width via font_small.size() (no drawing),
+        then pack them left-to-right, wrapping to a new row whenever the
+        next item would overflow the available width. Called once per
+        frame from run(), before the chart height is known - draw_control_
+        bar() and _render_ui_overlay_gl() then just draw/size against the
+        result cached on self._control_bar_rows / self.control_bar_h rather
+        than recomputing it.
 
-        self.control_rects = []
+        Returns (rows, total_height). Each item in a row is a dict with
+        resolved x/y (relative to the bar's own top-left) plus enough info
+        for draw_control_bar to render it and, for buttons, register a
+        click hit-box."""
+        margin = 10
         btn_h = self.CONTROL_BAR_H - 16
-        pad_y = bar_y + 8
-        x = 10
+        row_gap = 4
 
-        def draw_button(label, active=False, border_color=None):
-            nonlocal x
-            text_s = self.font_small.render(label, True, BG if active else TEXT)
-            btn_w = text_s.get_width() + 18
-            rect = pygame.Rect(x, pad_y, btn_w, btn_h)
-            bg_color = self.primary if active else PANEL
-            pygame.draw.rect(self.screen, bg_color, rect, border_radius=4)
-            pygame.draw.rect(self.screen, border_color or LINE, rect, 1, border_radius=4)
-            self.screen.blit(
-                text_s,
-                (rect.x + (rect.w - text_s.get_width()) // 2,
-                 rect.y + (rect.h - text_s.get_height()) // 2),
-            )
-            x += btn_w + 6
-            return rect
+        items = []
+
+        def add_button(label, kind, key, active=False, border_color=None,
+                        gap_before=6, group_start=False):
+            items.append({
+                "is_button": True, "label": label, "kind": kind, "key": key,
+                "active": active, "border_color": border_color,
+                "gap_before": gap_before, "group_start": group_start,
+            })
+
+        def add_label(text, gap_before=14, group_start=True):
+            items.append({
+                "is_button": False, "label": text,
+                "gap_before": gap_before, "group_start": group_start,
+            })
 
         for key, label in [("bars", "Bars"), ("wave", "Wave"),
                             ("radial", "Radial"), ("particles", "Particles"),
                             ("rainbow", "Rainbow"), ("futuristic", "Futuristic"),
                             ("grid", "Neon Grid")]:
-            rect = draw_button(label, active=(self.mode == key))
-            self.control_rects.append((rect, "mode", key))
+            add_button(label, "mode", key, active=(self.mode == key))
 
-        x += 14
-        gain_label = self.font_small.render(f"gain {self.gain:.1f}", True, TEXT_DIM)
-        self.screen.blit(gain_label, (x, pad_y + (btn_h - gain_label.get_height()) // 2))
-        x += gain_label.get_width() + 8
-        for key, label in [("gain-", "-"), ("gain+", "+")]:
-            rect = draw_button(label)
-            self.control_rects.append((rect, "gain", key))
+        add_label(f"gain {self.gain:.1f}")
+        add_button("-", "gain", "gain-", gap_before=8)
+        add_button("+", "gain", "gain+")
 
-        x += 14
-        smooth_label = self.font_small.render(f"smooth {self.smoothing:.2f}", True, TEXT_DIM)
-        self.screen.blit(smooth_label, (x, pad_y + (btn_h - smooth_label.get_height()) // 2))
-        x += smooth_label.get_width() + 8
-        for key, label in [("smooth-", "-"), ("smooth+", "+")]:
-            rect = draw_button(label)
-            self.control_rects.append((rect, "smooth", key))
+        add_label(f"smooth {self.smoothing:.2f}")
+        add_button("-", "smooth", "smooth-", gap_before=8)
+        add_button("+", "smooth", "smooth+")
 
-        x += 14
-        theme_rect = draw_button(f"theme: {THEMES[self.theme_idx]['name']}",
-                                  border_color=self.primary)
-        self.control_rects.append((theme_rect, "theme", "cycle"))
+        add_button(f"theme: {THEMES[self.theme_idx]['name']}", "theme", "cycle",
+                   border_color=self.primary, gap_before=14, group_start=True)
 
-        x += 14
-        fs_label = "windowed" if self.fullscreen else "fullscreen"
-        fs_rect = draw_button(fs_label)
-        self.control_rects.append((fs_rect, "fullscreen", "toggle"))
+        add_button("windowed" if self.fullscreen else "fullscreen", "fullscreen", "toggle",
+                   gap_before=14, group_start=True)
+
+        for item in items:
+            text_w, text_h = self.font_small.size(item["label"])
+            item["text_h"] = text_h
+            item["w"] = text_w + (18 if item["is_button"] else 0)
+
+        rows = [[]]
+        cursor_x = margin
+        for item in items:
+            first_in_row = len(rows[-1]) == 0
+            gap = 0 if first_in_row else item["gap_before"]
+            if not first_in_row and cursor_x + gap + item["w"] > w - margin:
+                rows.append([])
+                first_in_row = True
+                gap = 0
+            item["x"] = (margin if first_in_row else cursor_x) + gap
+            item["draw_separator"] = item["group_start"] and not first_in_row
+            cursor_x = item["x"] + item["w"]
+            rows[-1].append(item)
+
+        for r, row in enumerate(rows):
+            row_y = 8 + r * (btn_h + row_gap)
+            for item in row:
+                item["y"] = row_y
+
+        total_h = 16 + len(rows) * btn_h + (len(rows) - 1) * row_gap
+        return rows, total_h
+
+    def draw_control_bar(self, w, h):
+        """Draws the clickable bottom control bar from the layout computed
+        this frame by _layout_control_bar() (see run()), and rebuilds the
+        hit-test rects used by handle_control_click()."""
+        bar_y = h - self.control_bar_h
+        pygame.draw.rect(self.screen, PANEL, (0, bar_y, w, self.control_bar_h))
+        pygame.draw.line(self.screen, LINE, (0, bar_y), (w, bar_y), 1)
+
+        btn_h = self.CONTROL_BAR_H - 16
+        self.control_rects = []
+        for row in self._control_bar_rows:
+            for item in row:
+                x, y = item["x"], bar_y + item["y"]
+                if item["draw_separator"]:
+                    sep_x = x - item["gap_before"] / 2
+                    pygame.draw.line(self.screen, LINE, (sep_x, y), (sep_x, y + btn_h), 1)
+                if item["is_button"]:
+                    rect = pygame.Rect(x, y, item["w"], btn_h)
+                    active = item["active"]
+                    text_s = self.font_small.render(item["label"], True, BG if active else TEXT)
+                    bg_color = self.primary if active else PANEL
+                    pygame.draw.rect(self.screen, bg_color, rect, border_radius=4)
+                    pygame.draw.rect(self.screen, item["border_color"] or LINE, rect, 1, border_radius=4)
+                    self.screen.blit(
+                        text_s,
+                        (rect.x + (rect.w - text_s.get_width()) // 2,
+                         rect.y + (rect.h - text_s.get_height()) // 2),
+                    )
+                    self.control_rects.append((rect, item["kind"], item["key"]))
+                else:
+                    text_s = self.font_small.render(item["label"], True, TEXT_DIM)
+                    self.screen.blit(text_s, (x, y + (btn_h - text_s.get_height()) // 2))
 
     def handle_control_click(self, pos):
         for rect, kind, key in self.control_rects:
@@ -1731,14 +2251,41 @@ class Visualizer:
                         elif event.type == pygame.VIDEORESIZE:
                             global WINDOW_W, WINDOW_H
                             WINDOW_W, WINDOW_H = event.w, event.h
-                            if not self.fullscreen:
-                                try:
-                                    self.screen = self._create_display(
-                                        event.w, event.h, fullscreen=False,
-                                        want_gl=self.gl_requested,
-                                    )
-                                except Exception:
-                                    logging.exception("Failed to resize display surface")
+                            # Actual resizing is handled by the size-sync
+                            # check below, not here - see its comment for why.
+
+                    # Sync self.screen to the OS window's actual current size
+                    # rather than trusting VIDEORESIZE's payload. Clicking
+                    # native maximize/restore/minimize buttons (as opposed to
+                    # dragging an edge) doesn't reliably deliver a correctly-
+                    # timed VIDEORESIZE on every SDL/driver combination, which
+                    # left self.screen (and therefore the rendered content
+                    # AND the control bar's click hit-boxes, which are built
+                    # against self.screen's size) out of sync with the real
+                    # window - the visible symptom being a GUI that doesn't
+                    # rescale, or buttons that don't respond where they look
+                    # like they should. Polling get_window_size() every frame
+                    # is cheap and catches every case uniformly. Also always
+                    # passes want_gl=self.use_gl (the renderer currently
+                    # active), not self.gl_requested (just "is GL possible on
+                    # this machine") - using the latter here previously meant
+                    # a manually-forced-software renderer (via 'g') could get
+                    # silently flipped back to GPU rendering by an unrelated
+                    # resize, which is the same class of bug as fullscreen
+                    # toggling doing the same thing (see toggle_fullscreen).
+                    if not self.fullscreen:
+                        actual_size = pygame.display.get_window_size()
+                        if (
+                            actual_size[0] > 0 and actual_size[1] > 0
+                            and actual_size != self.screen.get_size()
+                        ):
+                            try:
+                                self.screen = self._create_display(
+                                    actual_size[0], actual_size[1],
+                                    fullscreen=False, want_gl=self.use_gl,
+                                )
+                            except Exception:
+                                logging.exception("Failed to sync display surface to window size")
 
                     samples = self.capture.latest_samples()
                     if samples is not None and len(samples) > 0:
@@ -1748,7 +2295,8 @@ class Visualizer:
                     self.beat_flash = 1.0 if beat else max(0.0, self.beat_flash - 0.06)
 
                     w, h = self.screen.get_size()
-                    chart_h = max(50, h - self.CONTROL_BAR_H)
+                    self._control_bar_rows, self.control_bar_h = self._layout_control_bar(w)
+                    chart_h = max(50, h - self.control_bar_h)
 
                     if self.use_gl:
                         try:
@@ -1764,7 +2312,8 @@ class Visualizer:
                                     w, h, self.fullscreen, want_gl=False
                                 )
                                 w, h = self.screen.get_size()
-                                chart_h = max(50, h - self.CONTROL_BAR_H)
+                                self._control_bar_rows, self.control_bar_h = self._layout_control_bar(w)
+                                chart_h = max(50, h - self.control_bar_h)
                             except Exception:
                                 logging.exception(
                                     "Failed to recreate software display after GPU fallback"
@@ -1817,6 +2366,9 @@ def main():
             initial_gain = selection["gain"]
             initial_smoothing = selection["smoothing"]
             initial_theme = selection.get("theme_idx", 0)
+            initial_attack = selection.get("attack", SPECTRUM_ATTACK)
+            initial_beat_sensitivity = selection.get("beat_sensitivity", 1.4)
+            force_software = selection.get("force_software", False)
         else:
             logging.warning("Tkinter not available - falling back to console picker")
             print("Tkinter isn't available on this system, falling back to console mode.\n")
@@ -1826,16 +2378,19 @@ def main():
                 print(f"  {update['url']}\n")
             device = choose_device(p)
             initial_mode, initial_gain, initial_smoothing, initial_theme = "bars", 1.4, 0.7, 0
+            initial_attack, initial_beat_sensitivity, force_software = SPECTRUM_ATTACK, 1.4, False
 
         print(f"\nUsing: {device['name']}  ({device['kind']})")
         print("Opening visualizer window... (press ESC in the window to quit)\n")
         logging.info(f"Launching visualizer window with device: {device['name']}")
 
         capture = AudioCapture(p, device)
-        viz = Visualizer(capture, device["name"])
+        viz = Visualizer(capture, device["name"], force_software=force_software)
         viz.mode = initial_mode
         viz.gain = initial_gain
         viz.smoothing = initial_smoothing
+        viz.attack = initial_attack
+        viz.beat_sensitivity = initial_beat_sensitivity
         viz.set_theme(initial_theme)
         viz.run()
         logging.info("Program exited normally")
