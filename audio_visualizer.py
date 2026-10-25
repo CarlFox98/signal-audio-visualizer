@@ -1,5 +1,5 @@
 """
-Signal — a native desktop audio visualizer for Windows.
+Signal: a native desktop audio visualizer for Windows.
 
 Captures system/output audio directly via WASAPI loopback (no virtual
 cable needed) or from any physical microphone, and renders a real-time
@@ -445,9 +445,9 @@ def list_capture_devices(p):
             and dev["name"].startswith(default_output_name)
         )
         kind = (
-            "system audio (loopback) — your main output, captures everything"
+            "system audio (loopback); your main output, captures everything"
             if is_default
-            else "alternate device (loopback) — route a single app here to isolate it"
+            else "alternate device (loopback); route a single app here to isolate it"
         )
         devices.append({
             "index": dev["index"],
@@ -496,11 +496,11 @@ def choose_device(p):
 
         print("\nAvailable audio sources:\n")
         for n, d in enumerate(devices):
-            print(f"  [{n}] {d['name']}  —  {d['kind']}")
+            print(f"  [{n}] {d['name']}: {d['kind']}")
         print()
         print("  [i] install a virtual audio cable now (lets you isolate a single app)")
         print()
-        print("Tip — to visualize ONLY one app (e.g. Spotify) instead of everything:")
+        print("Tip: to visualize ONLY one app (e.g. Spotify) instead of everything:")
         print("  1. Install the virtual cable (option 'i' above, or vb-audio.com/Cable)")
         print("  2. Windows Settings > System > Sound > Volume mixer")
         print("     -> set that one app's output device to the virtual cable")
@@ -644,7 +644,7 @@ def run_gui_launcher(p):
         devices_holder["devices"] = devices
         listbox.delete(0, tk.END)
         for d in devices:
-            listbox.insert(tk.END, f"{d['name']}  —  {d['kind']}")
+            listbox.insert(tk.END, f"{d['name']}: {d['kind']}")
         status_var.set(f"found {len(devices)} device(s)")
 
         if select_saved and saved.get("device_name"):
@@ -703,7 +703,7 @@ def run_gui_launcher(p):
     install_btn.pack(side="left", padx=(8, 0))
 
     tip = (
-        "Tip — to visualize ONLY one app (e.g. Spotify): install the virtual cable "
+        "Tip: to visualize ONLY one app (e.g. Spotify): install the virtual cable "
         "above, then in Windows Settings > System > Sound > Volume mixer set that "
         "app's output to the virtual cable, then pick its loopback entry here."
     )
@@ -897,7 +897,7 @@ class Visualizer:
 
     def __init__(self, capture, source_label, force_software=False):
         pygame.init()
-        pygame.display.set_caption("SIGNAL_VIS — " + source_label)
+        pygame.display.set_caption("SIGNAL_VIS: " + source_label)
 
         # pygame.display.Info() only reliably reports the TRUE desktop
         # resolution before any window/mode has been set - afterward, on
