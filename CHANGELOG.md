@@ -89,7 +89,7 @@ this repository's first commit.
   published, shows a clickable notice in the launcher (or prints a link in
   console-fallback mode). Runs on a background thread, times out after 4
   seconds, and silently does nothing on any failure (offline, no releases
-  published yet, rate limiting) — never blocks or interrupts startup.
+  published yet, rate limiting). It never blocks or interrupts startup.
 - WASAPI loopback capture (system audio, per-app via VB-CABLE) and
   microphone/line-in capture via `pyaudiowpatch`.
 - Seven visual modes: bars, waveform, radial, particles, rainbow bars,
@@ -109,6 +109,6 @@ this repository's first commit.
 ### Known notes
 
 - `requirements.txt` pins `numpy==2.5.1`, `pygame-ce==2.5.7`,
-  `pyaudiowpatch==0.2.12.8` as a tested combination — a past `pygame-ce`
+  `pyaudiowpatch==0.2.12.8` as a tested combination; a past `pygame-ce`
   update introduced a real rendering bug, so test thoroughly before
   upgrading any of these.
